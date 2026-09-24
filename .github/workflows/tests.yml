@@ -1,0 +1,21 @@
+name: Tests
+on:
+  push:
+    paths:  # ไม่รันจาก commit "update seen state" ของบอท (แตะแค่ state/seen.json)
+      - "check_ratchakitcha.py"
+      - "keywords.txt"
+      - "tests/**"
+      - ".github/workflows/tests.yml"
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python tests/test_check_ratchakitcha.py

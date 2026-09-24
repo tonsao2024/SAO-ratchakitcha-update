@@ -8,22 +8,24 @@
 1. ดาวน์โหลด meta/<ปี>/<ปี-เดือน>.jsonl ของทุกเดือนที่ครอบคลุม LOOKBACK_DAYS วันล่าสุด
    (1 บรรทัด = 1 ประกาศ: doctitle, bookNo, section, category, pageNo, publishDate, source_url …)
 2. เลือกประกาศที่ publishDate อยู่ในช่วงนั้น (ตัด record ทดสอบระบบ is_test ออก)
-3. จับคำค้นจาก keywords.txt ใน "ชื่อเรื่อง" (doctitle)
-4. แจ้ง LINE เฉพาะรายการที่ยังไม่เคยแจ้ง (จำไว้ใน state/seen.json)
+3. จับคำค้นจาก keywords.txt ใน "ชื่อเรื่อง" (doctitle) และตัดรายการที่เคยแจ้งไปแล้วออก
+4. แจ้ง LINE "เฉพาะเมื่อมีรายการใหม่จริง ๆ" — รายการที่เคยแจ้งแล้วจะไม่แจ้งซ้ำ (จำใน state/seen.json)
+   ถ้าไม่พบ หรือไม่มีอะไรใหม่ จะไม่ส่งข้อความเลย (ดูผลการทำงานได้ใน log / สรุปของ GitHub Actions)
+   กรณียดึงข้อมูลไม่ได้ จะแจ้งเตือนแบบจำกัดความถี่ (ERROR_REPEAT_HOURS) กันข้อความรบกวนช่วงระบบล่ม
 """
-import json, os, random, re, sys, time, unicodedata
+import hashlib, json, os, random, re, sys, time, unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
 
-def _env_int(name, default):
+def _env_int(name, default, minimum=1):
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
     try:
-        return max(1, int(raw))
+        return max(minimum, int(raw))
     except ValueError:
         print(f"⚠️ {name}={raw!r} ไม่ใช่ตัวเลข — ใช้ค่าเริ่มต้น {default}", flush=True)
         return default
@@ -38,7 +40,7 @@ SOURCE_ID = f"huggingface:{HF_DATASET}"
 SOURCE_NAME = "Open Law Data Thailand"
 
 LOOKBACK_DAYS = _env_int("LOOKBACK_DAYS", 30)  # ตรวจประกาศย้อนหลังกี่วัน
-STALE_DAYS = _env_int("STALE_DAYS", 7)  # ประกาศล่าสุดเก่ากว่านี้ = เตือน (ช่วงหยุดยาวสงกรานต์ห่างได้ถึง 6 วัน)
+ERROR_REPEAT_HOURS = _env_int("ERROR_REPEAT_HOURS", 24, minimum=0)  # ดึงข้อมูลไม่ได้ → แจ้งซ้ำถี่สุดกี่ ชม. (0 = ทุกรอบ)
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
 BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "5"))  # ตั้งเป็น 0 ตอนเทสเพื่อไม่ต้องรอ
 LINE_API = os.environ.get("LINE_API_BASE", "https://api.line.me")
@@ -92,6 +94,28 @@ def parse_day(value):
 
 def thai_date(d):
     return f"{d.day} {THAI_MONTHS[d.month - 1]} {d.year + 543}"
+
+
+def short_hash(text):
+    """ลายนิ้วมือสั้น ๆ ของข้อความ ใช้จำว่าเคยแจ้งปัญหาหรือรายการนี้ไปแล้ว"""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def iso_utc(dt=None):
+    return (dt or utc_now()).isoformat(timespec="seconds")
+
+
+def parse_iso(value):
+    """'2026-09-24T06:51:59+00:00' → datetime (หรือ None ถ้าอ่านไม่ได้)"""
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def months_between(start, end):
@@ -232,10 +256,13 @@ def to_item(rec):
     rid = str(rec.get("id") or "").strip()
     src = str(rec.get("source_url") or "").strip()
     d = parse_day(rec.get("publishDate")) or parse_day(rid) or parse_day(pdf)
+    title = " ".join(str(rec.get("doctitle") or "").split())
+    key = pdf or rid or src                   # pdf_file = รหัสคงที่ ไม่ซ้ำ (join key ของชุดข้อมูล)
+    alt = {k for k in (pdf, rid, src, title_key(title, d)) if k} - {key}
     return {
-        "key": pdf or rid or src,                  # pdf_file = รหัสคงที่ ไม่ซ้ำ (join key ของชุดข้อมูล)
-        "alt_keys": {k for k in (rid, src) if k},  # รองรับ state เดิมที่จำเป็น URL
-        "title": " ".join(str(rec.get("doctitle") or "").split()),
+        "key": key,
+        "alt_keys": alt,                      # รองรับ state เดิม (URL) และ record ที่ถูกออกใหม่ด้วยรหัสอื่น
+        "title": title,
         "date": d,
         "url": src or hf_pdf_url(pdf) or DATASET_PAGE,
         "meta": describe(rec, d),
@@ -243,21 +270,31 @@ def to_item(rec):
     }
 
 
+def title_key(title, d):
+    """คีย์สำรองจากชื่อเรื่อง+วันที่ — กันแจ้งซ้ำเมื่อประกาศเดิมโผล่มาอีก record ที่ id/pdf_file ต่างกัน"""
+    body = norm(title)
+    if not body:
+        return ""
+    return f"t:{d.isoformat() if d else ''}:{short_hash(body)}"
+
+
 def find_hits(items, kws, seen):
     nkws = [(k, norm(k)) for k in kws]
-    hits = {}
+    hits, claimed = [], set()  # claimed = คีย์ของรายการที่จะแจ้งในรอบนี้ (กัน record ซ้ำในรอบเดียวกัน)
     for it in items:
-        if not it["key"] or not it["title"] or it["key"] in hits:
+        if not it["key"] or not it["title"]:
             continue
-        if it["key"] in seen or it["alt_keys"] & seen:
+        keys = {it["key"]} | it["alt_keys"]
+        if keys & seen or keys & claimed:
             continue
         title = norm(it["title"])
         found = [(k, nk) for k, nk in nkws if nk in title]
         # ไม่ต้องแสดงคำที่เป็นส่วนหนึ่งของคำที่ยาวกว่า (เช่น "ตรวจเงินแผ่นดิน" ใน "สำนักงานการตรวจเงินแผ่นดิน")
         matched = [k for k, nk in found if not any(nk != o and nk in o for _, o in found)]
         if matched:
-            hits[it["key"]] = (it, matched)
-    return sorted(hits.values(), key=lambda h: (h[0]["date"], h[0]["key"]), reverse=True)
+            claimed |= keys
+            hits.append((it, matched))
+    return sorted(hits, key=lambda h: (h[0]["date"], h[0]["key"]), reverse=True)
 
 
 # ------------------------------------------------------------------ messages
@@ -272,15 +309,9 @@ def format_hit(i, it, matched):
     return "\n".join(lines)
 
 
-def source_footer(newest, today):
-    lines = []
-    if newest is None:
-        lines.append("⚠️ ฐานข้อมูลอาจยังไม่อัปเดต — ไม่พบประกาศในช่วงที่ตรวจเลย")
-    elif (today - newest).days >= STALE_DAYS:
-        lines.append(f"⚠️ ฐานข้อมูลอาจยังไม่อัปเดต — ประกาศล่าสุดในฐานคือ {thai_date(newest)} "
-                     f"({(today - newest).days} วันก่อน)")
-    lines.append(f"แหล่งข้อมูล: {SOURCE_NAME}" + (f" (ข้อมูลถึง {thai_date(newest)})" if newest else ""))
-    return "\n".join(lines)
+def source_footer(newest):
+    """บรรทัดปิดท้ายข้อความที่แจ้งเตือน — บอกว่าข้อมูลในฐานล่าสุดถึงวันไหน"""
+    return f"แหล่งข้อมูล: {SOURCE_NAME}" + (f" (ข้อมูลถึง {thai_date(newest)})" if newest else "")
 
 
 def pack(blocks):
@@ -326,17 +357,23 @@ def push_line(messages):
                         f"(ตรวจว่า Channel access token / LINE_TO ถูกต้องหรือไม่)")
 
 
+def write_summary(title, text):
+    """เขียนบันทึกลงหน้าสรุปของ GitHub Actions (ถ้ารันใน Actions)"""
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not summary:
+        return
+    try:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(f"### {title}\n\n```text\n{text}\n```\n\n")
+    except OSError as e:
+        log(f"⚠️ เขียนสรุปของ Actions ไม่ได้: {e}")
+
+
 def report_to_actions(messages, sent):
     """แสดงข้อความในหน้าสรุปของ GitHub Actions (และเป็น notice เมื่อไม่ได้ส่งจริง)"""
-    if os.environ.get("GITHUB_ACTIONS") != "true":
-        return
     text = "\n\n".join(messages)
-    label = "ส่งแล้ว" if sent else "DRY RUN — ไม่ได้ส่งจริง"
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as f:
-            f.write(f"### ข้อความ LINE ({label})\n\n```text\n{text}\n```\n")
-    if not sent:
+    write_summary(f"ข้อความ LINE ({'ส่งแล้ว' if sent else 'DRY RUN — ไม่ได้ส่งจริง'})", text)
+    if os.environ.get("GITHUB_ACTIONS") == "true" and not sent:
         esc = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print(f"::notice title=ข้อความ LINE (DRY RUN)::{esc}", flush=True)
 
@@ -351,6 +388,7 @@ def deliver(messages, sending):
 
 # ------------------------------------------------------------------- state
 def load_state():
+    """คืน (source, seen, last_error) โดย last_error = {"sig": str, "at": datetime|None}"""
     try:
         data = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
     except (OSError, ValueError) as e:
@@ -358,12 +396,17 @@ def load_state():
         data = {}
     if not isinstance(data, dict):
         data = {}
-    return data.get("source"), {str(x) for x in data.get("seen") or [] if x}
+    err = data.get("last_error") if isinstance(data.get("last_error"), dict) else {}
+    seen = {str(x) for x in data.get("seen") or [] if x}
+    return data.get("source"), seen, {"sig": str(err.get("sig") or ""), "at": parse_iso(err.get("at"))}
 
 
-def save_state(seen):
+def save_state(seen, last_error=None):
+    """บันทึก state — last_error = {"sig", "at", "detail"} เพื่อจำว่าปัญหานี้แจ้งไปแล้ว (None = ล้าง)"""
     STATE.parent.mkdir(parents=True, exist_ok=True)
     data = {"source": SOURCE_ID, "seen": sorted(seen)[-MAX_SEEN:]}
+    if last_error:
+        data["last_error"] = last_error
     STATE.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
@@ -378,7 +421,7 @@ def main():
     if not sending:
         log("⚠️ DRY RUN — " + ("ตั้ง DRY_RUN ไว้" if DRY_RUN else "ยังไม่ได้ตั้งค่า LINE_CHANNEL_ACCESS_TOKEN")
             + ": จะพิมพ์ข้อความแทนการส่ง LINE และไม่บันทึก state")
-    source, seen = load_state()
+    source, seen, last_error = load_state()
     first_run = source != SOURCE_ID
     log(f"แหล่งข้อมูล: {DATASET_PAGE}")
     log(f"ตรวจประกาศวันที่ {cutoff} ถึง {today} ({LOOKBACK_DAYS} วัน), คำค้น {len(kws)} คำ, "
@@ -389,8 +432,18 @@ def main():
     except FetchError as e:
         # ดึงข้อมูลไม่ได้ → แจ้งเตือนผ่าน LINE แล้วจบแบบไม่พัง CI (exit 0)
         # เพราะความขัดข้องชั่วคราวของ Hugging Face ไม่ควรทำให้รันแดง
+        # แต่ถ้าเพิ่งแจ้งปัญหาเดิมไปเมื่อไม่นาน จะไม่ส่งซ้ำ (กันข้อความรบกวนช่วงระบบล่มยาว)
+        detail = str(e)
+        sig = short_hash(detail)
+        last_at = last_error["at"]
+        if (last_error["sig"] == sig and last_at
+                and utc_now() - last_at < timedelta(hours=ERROR_REPEAT_HOURS)):
+            log(f"ℹ️ ดึงข้อมูลไม่ได้เหมือนรอบก่อน (แจ้งไปแล้ว {last_at.astimezone(TH):%d/%m %H:%M} น.) "
+                f"— ไม่ส่งซ้ำภายใน {ERROR_REPEAT_HOURS} ชม.\n{detail}")
+            write_summary("ℹ️ ดึงข้อมูลไม่ได้ (แจ้งไปแล้ว — ไม่ส่งซ้ำ)", detail)
+            return 0
         msg = (f"⚠️ ตรวจราชกิจจาฯ ไม่สำเร็จ ({now_str})\n"
-               f"ดึงข้อมูลจาก {SOURCE_NAME} (Hugging Face) ไม่ได้\n{e}\n"
+               f"ดึงข้อมูลจาก {SOURCE_NAME} (Hugging Face) ไม่ได้\n{detail}\n"
                f"จะลองใหม่อัตโนมัติรอบถัดไป\n{DATASET_PAGE}")
         log(msg)
         try:
@@ -398,6 +451,8 @@ def main():
         except LineError as le:
             log(f"❌ {le}")
             return 1  # ส่ง LINE ไม่ได้เลย → ให้ CI แดงเพื่อเตือนว่าต้องแก้ token
+        if sending:
+            save_state(seen, {"sig": sig, "at": iso_utc(), "detail": detail[:200]})
         return 0
 
     items = [it for it in map(to_item, records) if not it["is_test"]]
@@ -411,21 +466,27 @@ def main():
 
     first_note = (f"(รอบแรกหลังเปลี่ยนมาใช้ฐานข้อมูล {SOURCE_NAME} — ตรวจย้อนหลัง {LOOKBACK_DAYS} วัน)"
                   if first_run else "")
-    if hits:
-        head = f"🔔 ราชกิจจาฯ พบประกาศใหม่ที่เกี่ยวกับ สตง. {len(hits)} รายการ ({now_str})"
-        blocks = ["\n".join(x for x in (head, first_note) if x)]
-        blocks += [format_hit(i, it, m) for i, (it, m) in enumerate(to_send, 1)]
-        if len(hits) > len(to_send):
-            blocks.append(f"…ยังมีอีก {len(hits) - len(to_send)} รายการ จะแจ้งในรอบถัดไป")
-        blocks.append(source_footer(newest, today))
-    else:
+    if not hits:
+        # ไม่มีของใหม่จริง ๆ → ไม่ส่งข้อความ LINE (กันการรบกวน) แต่ทิ้งร่องรอยไว้ใน Actions
         dates = [it["date"] for it in recent]
         span = (f"ตรวจแล้ว {len(recent):,} รายการ (ประกาศ {thai_date(min(dates))} – {thai_date(max(dates))})"
                 if dates else "ไม่มีประกาศในช่วงที่ตรวจ")
-        blocks = ["\n".join(x for x in (
-            f"✅ ราชกิจจาฯ รอบ {now_str}",
-            f"ไม่พบประกาศใหม่ตามคำค้น สตง. ({len(kws)} คำ)",
-            span, first_note, source_footer(newest, today), DATASET_PAGE) if x)]
+        log(f"ℹ️ ไม่พบประกาศใหม่ตามคำค้น สตง. ({len(kws)} คำ) — {span} — ไม่ส่งข้อความ LINE")
+        write_summary("ℹ️ ไม่พบประกาศใหม่ (ไม่ส่ง LINE)", "\n".join(x for x in (
+            f"ตรวจคำค้น {len(kws)} คำ · {span}",
+            f"เคยแจ้งแล้ว {len(seen)} รายการ (จะไม่แจ้งซ้ำ)",
+            source_footer(newest),
+            DATASET_PAGE) if x))
+        if sending and last_error["sig"]:
+            save_state(seen)  # กลับมาปกติแล้ว → ล้างสถานะแจ้งปัญหา เพื่อให้รอบถัดไปถ้าพังจะได้แจ้งทันที
+        return 0
+
+    head = f"🔔 ราชกิจจาฯ พบประกาศใหม่ที่เกี่ยวกับ สตง. {len(hits)} รายการ ({now_str})"
+    blocks = ["\n".join(x for x in (head, first_note) if x)]
+    blocks += [format_hit(i, it, m) for i, (it, m) in enumerate(to_send, 1)]
+    if len(hits) > len(to_send):
+        blocks.append(f"…ยังมีอีก {len(hits) - len(to_send)} รายการ จะแจ้งในรอบถัดไป")
+    blocks.append(source_footer(newest))
 
     try:
         deliver(pack(blocks), sending)
@@ -434,7 +495,8 @@ def main():
         return 1  # ไม่บันทึก state → รายการเหล่านี้จะถูกแจ้งอีกครั้งในรอบถัดไป
 
     if sending:
-        seen.update(it["key"] for it, _ in to_send)
+        for it, _ in to_send:  # จำทุกคีย์ (รวมชื่อเรื่อง+วันที่) กันแจ้งซ้ำถ้าประกาศเดิมถูกออกด้วยรหัสอื่น
+            seen.update({it["key"]} | it["alt_keys"])
         save_state(seen)
     log(f"เสร็จสิ้น: แจ้ง {len(to_send)} รายการ" + ("" if sending else " (DRY RUN)"))
     return 0
