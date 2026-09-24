@@ -1,0 +1,48 @@
+# TEMPORARY — ทดสอบกับชุดข้อมูลจริงบน Hugging Face แบบ DRY RUN (ไม่ส่ง LINE) แล้วจะลบออก
+name: TEMP HF dry-run test
+on:
+  push:
+    branches: [arena/01a0d208-sao-ratchakitcha-update]
+    paths: [".github/workflows/tmp-hf-dryrun.yml"]
+permissions:
+  contents: read
+jobs:
+  dryrun:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - name: Dry run (default 30 days, first run) — no LINE secrets passed
+        env: { DRY_RUN: "1" }
+        run: |
+          set -o pipefail
+          python check_ratchakitcha.py 2>&1 | grep -v '^::notice' | tee out30.txt
+      - name: Missing month file must be 404 → None (not an error)
+        run: |
+          python - <<'EOF' 2>&1 | tee out404.txt
+          import check_ratchakitcha as c, requests
+          for ym in [(2026, 10), (2031, 1)]:
+              print(ym, "→", repr(c.http_get(c.meta_url(*ym))))
+          r = requests.get(c.meta_url(2026, 10), allow_redirects=False, timeout=30)
+          print("raw status:", r.status_code, r.headers.get("X-Error-Code"))
+          r = requests.get(c.meta_url(2026, 9), allow_redirects=False, timeout=30)
+          print("existing file first hop:", r.status_code, r.headers.get("Location", "")[:80])
+          EOF
+      - name: Dry run with LOOKBACK_DAYS=120 (more real hits, 5 month files)
+        env: { DRY_RUN: "1", LOOKBACK_DAYS: "120" }
+        run: |
+          set -o pipefail
+          python check_ratchakitcha.py 2>&1 | grep -v '^::notice' | tee out120.txt
+      - name: Publish logs as annotations
+        if: always()
+        run: |
+          python - <<'EOF'
+          import os
+          for f in ["out30.txt", "out404.txt", "out120.txt"]:
+              if os.path.exists(f):
+                  t = open(f, encoding="utf-8").read()[-60000:]
+                  esc = t.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::notice title={f}::{esc}")
+          EOF
