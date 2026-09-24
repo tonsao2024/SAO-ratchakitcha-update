@@ -4,8 +4,16 @@ on:
     - cron: "0 2 * * *"   # 09:00 น. เวลาไทย
     - cron: "0 11 * * *"  # 18:00 น. เวลาไทย
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "ทดสอบเท่านั้น (ไม่ส่ง LINE และไม่บันทึก state)"
+        type: boolean
+        default: false
 permissions:
   contents: write
+concurrency:  # กันสองรอบทำงานซ้อนกันแล้วแย่งกันบันทึก state
+  group: ratchakitcha-alert-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-24.04
@@ -18,15 +26,17 @@ jobs:
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_TO: ${{ secrets.LINE_TO }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}  # ไม่บังคับ — ชุดข้อมูลเป็นสาธารณะ
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
       - name: Save state
-        if: always()
+        if: ${{ always() && !inputs.dry_run }}
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add state/seen.json
           if ! git diff --cached --quiet; then
             git commit -m "update seen state"
-            git push
+            git push || { git pull --rebase && git push; }
           else
             echo "no state changes"
           fi
