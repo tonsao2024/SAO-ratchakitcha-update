@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - ".github/workflows/temp-live-dryrun.yml"
+      - ".github/temp-live-dryrun.py"
 permissions:
   contents: write
 jobs:

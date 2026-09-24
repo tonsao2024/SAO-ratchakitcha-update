@@ -1,5 +1,6 @@
 """ชั่วคราว: รันสคริปต์จริงกับข้อมูลจริง แต่สลับการส่ง LINE เป็นการพิมพ์ — ลบหลังตรวจเสร็จ"""
 import importlib.util, json, os, shutil, tempfile
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,14 @@ spec.loader.exec_module(bot)
 sent = []
 bot.push_line = sent.append  # แทนการยิง LINE จริง (main() จะคิดว่า "ส่งสำเร็จ" และบันทึก state)
 
+real_fetch = bot.fetch_records
+FAKE = {"new": None}
+
+
+def fetch_with_fake(start, end):
+    rows = real_fetch(start, end)
+    return rows + ([FAKE["new"]] if FAKE["new"] else [])
+
 
 def run(label):
     print(f"\n===== {label} =====", flush=True)
@@ -29,25 +38,20 @@ def run(label):
     return len(sent)
 
 
-def state_path():
-    return WORK / "state" / "seen.json"
-
-
+state_path = WORK / "state" / "seen.json"
 run("รอบที่ 1: state ว่าง (รอบแรก) — ควรแจ้งรายการที่ตรงคำค้น")
-seen1 = json.loads(state_path().read_text(encoding="utf-8"))
-print("\nkeys ที่จำไว้:", len(seen1["seen"]))
+print("keys ที่จำไว้:", len(json.loads(state_path.read_text(encoding="utf-8"))["seen"]))
 run("รอบที่ 2: ข้อมูลเดิม — ต้องไม่ส่งข้อความเลย")
 
-# จำลองว่า "มีของใหม่" โดยลบรายการหนึ่งออกจาก state (เหมือนเพิ่งตรวจพบครั้งแรก)
-items = json.loads(state_path().read_text(encoding="utf-8"))["seen"]
-title_keys = [k for k in items if k.startswith("t:")]
-drop = set()
-if title_keys:
-    stem = title_keys[-1].split(":", 2)[2]
-    drop = {k for k in items if stem in k}
-kept = [k for k in items if k not in drop]
-state_path().write_text(json.dumps({"source": seen1.get("source"), "seen": kept},
-                                   ensure_ascii=False, indent=1), encoding="utf-8")
-print(f"\n(จำลองของใหม่ 1 รายการ — ลบ {len(drop)} คีย์ออกชั่วคราว)")
-n = run("รอบที่ 3: มีของใหม่ 1 รายการ — ต้องแจ้งเฉพาะรายการนั้น")
-print(f"\nสรุป: รอบ 1 ส่ง {1 if seen1['seen'] else 0} ครั้ง · รอบ 3 ส่ง {n} ครั้ง (คาดหวัง 1)")
+FAKE["new"] = {
+    "id": f"{date.today().isoformat()}-15000000",
+    "doctitle": "ประกาศสำนักงานการตรวจเงินแผ่นดิน เรื่อง การจัดซื้อจัดจ้าง (ข้อมูลจำลองเพื่อทดสอบ)",
+    "bookNo": "143", "section": "57", "category": "ก", "pageNo": "99",
+    "publishDate": date.today().isoformat(),
+    "pdf_file": f"{date.today().isoformat()}-15000000.pdf",
+    "source_url": f"https://ratchakitcha.soc.go.th/documents/15000000.pdf", "is_test": False,
+}
+n3 = run("รอบที่ 3: เพิ่มรายการใหม่ 1 รายการ — ต้องแจ้งเฉพาะรายการใหม่ ไม่พูดถึงรายการเดิม")
+FAKE["new"] = None
+n4 = run("รอบที่ 4: ข้อมูลเดิมอีกครั้ง — ต้องเงียบ")
+print(f"\nสรุป: รอบ 1 = 1 · รอบ 2 = 0 · รอบ 3 = {n3} (คาดหวัง 1) · รอบ 4 = {n4} (คาดหวัง 0)")
