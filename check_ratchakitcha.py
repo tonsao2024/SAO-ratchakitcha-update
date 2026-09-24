@@ -38,7 +38,7 @@ SOURCE_ID = f"huggingface:{HF_DATASET}"
 SOURCE_NAME = "Open Law Data Thailand"
 
 LOOKBACK_DAYS = _env_int("LOOKBACK_DAYS", 30)  # ตรวจประกาศย้อนหลังกี่วัน
-STALE_DAYS = _env_int("STALE_DAYS", 5)         # ประกาศล่าสุดในฐานเก่ากว่านี้ = เตือน
+STALE_DAYS = _env_int("STALE_DAYS", 7)  # ประกาศล่าสุดเก่ากว่านี้ = เตือน (ช่วงหยุดยาวสงกรานต์ห่างได้ถึง 6 วัน)
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
 BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "5"))  # ตั้งเป็น 0 ตอนเทสเพื่อไม่ต้องรอ
 LINE_API = os.environ.get("LINE_API_BASE", "https://api.line.me")
