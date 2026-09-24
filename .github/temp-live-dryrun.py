@@ -27,6 +27,9 @@ def fetch_with_fake(start, end):
     return rows + ([FAKE["new"]] if FAKE["new"] else [])
 
 
+bot.fetch_records = fetch_with_fake
+
+
 def run(label):
     print(f"\n===== {label} =====", flush=True)
     sent.clear()
