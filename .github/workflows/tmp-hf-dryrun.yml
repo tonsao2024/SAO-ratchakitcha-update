@@ -1,4 +1,4 @@
-# TEMPORARY — ทดสอบกับชุดข้อมูลจริงบน Hugging Face แบบ DRY RUN (ไม่ส่ง LINE) แล้วจะลบออก
+# TEMPORARY — วิเคราะห์ข้อมูลจริงเพื่อตั้งค่าเริ่มต้น STALE_DAYS แล้วจะลบออก
 name: TEMP HF dry-run test
 on:
   push:
@@ -7,42 +7,44 @@ on:
 permissions:
   contents: read
 jobs:
-  dryrun:
+  analyze:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - run: pip install -r requirements.txt
-      - name: Dry run (default 30 days, first run) — no LINE secrets passed
-        env: { DRY_RUN: "1" }
+      - name: Publish-date gaps + SAO hits per month (2024-01 … 2026-09)
         run: |
-          set -o pipefail
-          python check_ratchakitcha.py 2>&1 | grep -v '^::notice' | tee out30.txt
-      - name: Missing month file must be 404 → None (not an error)
-        run: |
-          python - <<'EOF' 2>&1 | tee out404.txt
-          import check_ratchakitcha as c, requests
-          for ym in [(2026, 10), (2031, 1)]:
-              print(ym, "→", repr(c.http_get(c.meta_url(*ym))))
-          r = requests.get(c.meta_url(2026, 10), allow_redirects=False, timeout=30)
-          print("raw status:", r.status_code, r.headers.get("X-Error-Code"))
-          r = requests.get(c.meta_url(2026, 9), allow_redirects=False, timeout=30)
-          print("existing file first hop:", r.status_code, r.headers.get("Location", "")[:80])
+          python - <<'EOF' 2>&1 | tee out.txt
+          import collections, check_ratchakitcha as c
+          from datetime import date
+          kws = c.load_keywords(); nk = [c.norm(k) for k in kws]
+          dates, hits = set(), collections.Counter()
+          for y, m in c.months_between(date(2024, 1, 1), date(2026, 9, 1)):
+              body = c.http_get(c.meta_url(y, m))
+              if body is None: print("missing", y, m); continue
+              rows, _ = c.parse_jsonl(body)
+              for r in rows:
+                  it = c.to_item(r)
+                  if it["is_test"] or not it["date"] or it["date"] < date(2024, 1, 1): continue
+                  dates.add(it["date"])
+                  if any(k in c.norm(it["title"]) for k in nk):
+                      hits[it["date"].strftime("%Y-%m")] += 1
+          ds = sorted(d for d in dates if d <= date(2026, 9, 24))
+          gaps = sorted(((b - a).days, a, b) for a, b in zip(ds, ds[1:]))[::-1][:12]
+          print("distinct publish dates:", len(ds), ds[0], "→", ds[-1])
+          print("largest gaps (days between consecutive publish dates):")
+          for g, a, b in gaps: print(f"  {g}d  {a} ({a:%a}) → {b} ({b:%a})")
+          wd = collections.Counter(d.strftime("%a") for d in ds)
+          print("publish days by weekday:", dict(wd))
+          print("SAO keyword hits per month:", dict(sorted(hits.items())))
+          print("total hits:", sum(hits.values()))
           EOF
-      - name: Dry run with LOOKBACK_DAYS=120 (more real hits, 5 month files)
-        env: { DRY_RUN: "1", LOOKBACK_DAYS: "120" }
-        run: |
-          set -o pipefail
-          python check_ratchakitcha.py 2>&1 | grep -v '^::notice' | tee out120.txt
-      - name: Publish logs as annotations
+      - name: Publish log as annotation
         if: always()
         run: |
           python - <<'EOF'
-          import os
-          for f in ["out30.txt", "out404.txt", "out120.txt"]:
-              if os.path.exists(f):
-                  t = open(f, encoding="utf-8").read()[-60000:]
-                  esc = t.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-                  print(f"::notice title={f}::{esc}")
+          t = open("out.txt", encoding="utf-8").read()[-3500:]
+          print("::notice title=analysis::" + t.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
           EOF
