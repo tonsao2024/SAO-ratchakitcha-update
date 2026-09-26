@@ -1,6 +1,10 @@
 {
  "source": "huggingface:open-law-data-thailand/soc-ratchakitcha",
  "seen": [
-  "2026-09-23-00131199.pdf"
+  "2026-09-23-00131199.pdf",
+  "2026-09-25-00131573",
+  "2026-09-25-00131573.pdf",
+  "https://ratchakitcha.soc.go.th/documents/131573.pdf",
+  "t:2026-09-25:3072772f25e3"
  ]
 }
